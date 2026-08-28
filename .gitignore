@@ -1,0 +1,4 @@
+*.bak-*
+*.state.json
+logs/
+rclone.conf

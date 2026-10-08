@@ -1,4 +1,8 @@
 *.bak-*
 *.state.json
+*.launch.vbs
+*.stop.ps1
+*.refresh.ps1
+*.watchdog.ps1
 logs/
 rclone.conf

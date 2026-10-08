@@ -1,742 +1,194 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Інтерактивний інсталятор постійного rclone-монтування (WebDAV / SFTP) у Windows.
+    Перемикає профіль кешування існуючого rclone-монтування без перевстановлення.
 
 .DESCRIPTION
-    Повний цикл: перевірка та встановлення залежностей (WinFsp, rclone),
-    інтерактивний збір параметрів, генерація секції rclone.conf з obscured-паролем,
-    перевірка з'єднання, створення робочих тек, прихований VBS-лаунчер,
-    реєстрація завдань Планувальника (монтування при вході + watchdog),
-    запуск і верифікація.
+    Патчить лише прапорці кешу в уже згенерованому VBS-лаунчері: cache-mode,
+    attr-timeout, dir-cache-time, write-back, cache-max-age, poll-interval,
+    read-ahead, no-modtime. Решта (конфіг, літера, volname, links, сертифікат,
+    bwlimit, rc) лишається незмінною, тож пароль перевводити не треба.
 
-.PARAMETER Uninstall
-    Видалення: зупинка процесів, зняття завдань, опційне очищення конфігу і кешу.
+.PARAMETER Mode
+    FAST   - cache-mode full, довгий кеш, modtime увімкнено. Рекомендований.
+    STRICT - те саме, але короткі TTL: чужі зміни видно за ~5 с ціною гальм.
+    RAIDRIVE - без кешу читання, як у RaiDrive. Найповільніший.
 
 .PARAMETER ProfileName
-    Ім'я профілю = ім'я remote у rclone.conf. За замовчуванням 'synology'.
-
-.PARAMETER TargetUser
-    DOMAIN\User, під яким виконується завдання. Визначається автоматично.
+    Ім'я профілю (= ім'я remote). За замовчуванням 'synology'.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Install-RcloneMount.ps1
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Install-RcloneMount.ps1 -Uninstall -ProfileName synology
+    powershell -ExecutionPolicy Bypass -File .\Set-RcloneMountMode.ps1 -Mode FAST
 
 .NOTES
-    Файл має бути збережений у UTF-8 з BOM — PS 5.1 читає .ps1 без BOM як ANSI.
+    Файл має бути збережений у UTF-8 з BOM.
 #>
 
 [CmdletBinding()]
 param(
-    [switch] $Uninstall,
-    [string] $ProfileName = 'synology',
-    [string] $TargetUser
+    [Parameter(Mandatory)]
+    [ValidateSet('FAST','STRICT','RAIDRIVE')]
+    [string] $Mode,
+
+    [string] $ProfileName = 'synology'
 )
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
-# ---------------------------------------------------------------------------
-# Константи
-# ---------------------------------------------------------------------------
-$InstallRoot = 'C:\rclone'
-$StateFile   = Join-Path $InstallRoot "$ProfileName.state.json"
-$WinFspUrl   = 'https://winfsp.dev/rel/'
-$RcloneDlUrl = 'https://downloads.rclone.org/rclone-current-windows-amd64.zip'
+function Write-Ok    { param($m) Write-Host "[ok] $m" -ForegroundColor Green }
+function Write-Err   { param($m) Write-Host "[XX] $m" -ForegroundColor Red }
+function Write-Info  { param($m) Write-Host "     $m" -ForegroundColor Gray }
+function Write-Warn2 { param($m) Write-Host "[!!] $m" -ForegroundColor Yellow }
 
-# ---------------------------------------------------------------------------
-# Вивід
-# ---------------------------------------------------------------------------
-function Write-Step  { param($m) Write-Host "`n[==] $m" -ForegroundColor Cyan }
-function Write-Ok    { param($m) Write-Host "[ok] $m"   -ForegroundColor Green }
-function Write-Warn2 { param($m) Write-Host "[!!] $m"   -ForegroundColor Yellow }
-function Write-Err   { param($m) Write-Host "[XX] $m"   -ForegroundColor Red }
-function Write-Info  { param($m) Write-Host "     $m"   -ForegroundColor Gray }
-
-function Read-Default {
-    param([string]$Prompt, [string]$Default)
-    if ($Default) { $t = Read-Host "$Prompt [$Default]" } else { $t = Read-Host $Prompt }
-    if ([string]::IsNullOrWhiteSpace($t)) { return $Default }
-    return $t.Trim()
-}
-
-function Read-YesNo {
-    param([string]$Prompt, [bool]$Default = $true)
-    if ($Default) { $hint = 'Y/n' } else { $hint = 'y/N' }
-    while ($true) {
-        $t = Read-Host "$Prompt [$hint]"
-        if ([string]::IsNullOrWhiteSpace($t)) { return $Default }
-        switch -Regex ($t.Trim()) {
-            '^(y|yes|t|т|так)$' { return $true }
-            '^(n|no|н|ні)$'     { return $false }
-            default { Write-Warn2 'Введіть y або n.' }
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# UAC self-elevation. Оригінального користувача передаємо явно:
-# після елевації $env:USERNAME може вказувати на інший акаунт.
-# ---------------------------------------------------------------------------
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-if (-not $TargetUser) { $TargetUser = "$env:USERDOMAIN\$env:USERNAME" }
-
-if (-not (Test-Admin)) {
+# --- Елевація ---------------------------------------------------------------
+$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+          [Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Warn2 'Потрібні права адміністратора. Перезапуск через UAC...'
-    $psArgs = @(
+    Start-Process powershell.exe -Verb RunAs -ArgumentList @(
         '-NoProfile','-ExecutionPolicy','Bypass'
         '-File', "`"$PSCommandPath`""
-        '-ProfileName', $ProfileName
-        '-TargetUser', "`"$TargetUser`""
+        '-Mode', $Mode, '-ProfileName', $ProfileName
     )
-    if ($Uninstall) { $psArgs += '-Uninstall' }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $psArgs
     exit
 }
 
-# ---------------------------------------------------------------------------
-# rclone.conf: шлях цільового користувача + злиття секції
-# ---------------------------------------------------------------------------
-function Get-RcloneConfPath {
-    param([string]$User)
-    try {
-        $sid = (New-Object Security.Principal.NTAccount($User)).Translate(
-                 [Security.Principal.SecurityIdentifier]).Value
-        $key  = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-        $prof = (Get-ItemProperty -Path $key -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
-        $prof = [Environment]::ExpandEnvironmentVariables($prof)   # часто містить %SystemDrive%
-        if (Test-Path $prof) { return (Join-Path $prof 'AppData\Roaming\rclone\rclone.conf') }
-    } catch { }
-    Write-Warn2 "Не вдалося визначити профіль '$User'. Використано поточний."
-    return (Join-Path $env:APPDATA 'rclone\rclone.conf')
+$InstallRoot = 'C:\rclone'
+$StateFile   = Join-Path $InstallRoot "$ProfileName.state.json"
+$LaunchVbs   = Join-Path $InstallRoot "$ProfileName.launch.vbs"
+$TaskMount   = "rclone-$ProfileName-mount"
+
+if (-not (Test-Path $LaunchVbs)) {
+    Write-Err "Лаунчер не знайдено: $LaunchVbs"
+    Write-Info 'Спершу виконайте Install-RcloneMount.ps1.'
+    Read-Host 'Enter'; exit 1
 }
 
-function Set-RcloneSection {
-    # Замінює або додає секцію [name], зберігаючи решту remote
-    param([string]$Path, [string]$Name, [System.Collections.IDictionary]$Values)
-
-    $dir = Split-Path $Path -Parent
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-
-    $lines = @()
-    if (Test-Path $Path) { $lines = Get-Content -LiteralPath $Path -Encoding UTF8 }
-
-    $out  = New-Object System.Collections.Generic.List[string]
-    $skip = $false
-    foreach ($l in $lines) {
-        if ($l -match '^\s*\[(.+?)\]\s*$') { $skip = ($Matches[1] -eq $Name) }
-        if (-not $skip) { $out.Add($l) }
+# --- Набори прапорців -------------------------------------------------------
+# FAST спирається не на короткі TTL, а на modtime: з cache-mode full rclone
+# звіряє дату при кожному відкритті файлу і перезавантажує, якщо серверна
+# новіша. Тому довгий max-age безпечний, а повторні відкриття миттєві.
+$profiles = @{
+    FAST = @{
+        'vfs-cache-mode'          = 'full'
+        'vfs-cache-max-age'       = '24h'
+        'vfs-cache-poll-interval' = '1m'
+        'vfs-read-ahead'          = '128M'
+        'vfs-write-back'          = '2s'
+        'dir-cache-time'          = '30s'
+        'attr-timeout'            = '3s'
+        'no-modtime'              = $false
     }
-    while ($out.Count -gt 0 -and [string]::IsNullOrWhiteSpace($out[$out.Count-1])) {
-        $out.RemoveAt($out.Count-1)
+    STRICT = @{
+        'vfs-cache-mode'          = 'full'
+        'vfs-cache-max-age'       = '6h'
+        'vfs-cache-poll-interval' = '30s'
+        'vfs-read-ahead'          = '128M'
+        'vfs-write-back'          = '1s'
+        'dir-cache-time'          = '5s'
+        'attr-timeout'            = '1s'
+        'no-modtime'              = $false
     }
-    if ($out.Count -gt 0) { $out.Add('') }
-
-    $out.Add("[$Name]")
-    foreach ($k in $Values.Keys) { $out.Add("$k = $($Values[$k])") }
-    $out.Add('')
-
-    # rclone очікує UTF-8 БЕЗ BOM
-    [IO.File]::WriteAllLines($Path, $out.ToArray(), (New-Object Text.UTF8Encoding($false)))
-}
-
-function Remove-RcloneSection {
-    param([string]$Path, [string]$Name)
-    if (-not (Test-Path $Path)) { return }
-    $lines = Get-Content -LiteralPath $Path -Encoding UTF8
-    $out   = New-Object System.Collections.Generic.List[string]
-    $skip  = $false
-    foreach ($l in $lines) {
-        if ($l -match '^\s*\[(.+?)\]\s*$') { $skip = ($Matches[1] -eq $Name) }
-        if (-not $skip) { $out.Add($l) }
-    }
-    [IO.File]::WriteAllLines($Path, $out.ToArray(), (New-Object Text.UTF8Encoding($false)))
-}
-
-function Stop-RcloneByPath {
-    # Get-Process не має CommandLine у PS 5.1 -> фільтруємо за шляхом бінарника,
-    # щоб не вбити чужі екземпляри rclone (Rclone UI тощо).
-    param([string]$ExePath)
-    $p = @(Get-Process rclone -ErrorAction SilentlyContinue |
-           Where-Object { -not $ExePath -or $_.Path -eq $ExePath })
-    if ($p.Count -gt 0) {
-        $p | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep 2
-    }
-    return $p.Count
-}
-
-# ===========================================================================
-# ГІЛКА ВИДАЛЕННЯ
-# ===========================================================================
-if ($Uninstall) {
-    Write-Step "Видалення профілю '$ProfileName'"
-
-    $state = $null
-    if (Test-Path $StateFile) {
-        try { $state = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
-    }
-
-    foreach ($suffix in @('mount','watchdog')) {
-        $tn = "rclone-$ProfileName-$suffix"
-        if (Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue) {
-            Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName $tn -Confirm:$false
-            Write-Ok "Знято завдання: $tn"
-        }
-    }
-
-    # Завдання запускає wscript, тому Stop-ScheduledTask не вбиває rclone
-    $exeFromState = $null
-    if ($state) { $exeFromState = $state.RclonePath }
-    $killed = Stop-RcloneByPath -ExePath $exeFromState
-    Write-Ok "Зупинено процесів rclone: $killed"
-
-    foreach ($f in @(
-        (Join-Path $InstallRoot "$ProfileName.launch.vbs"),
-        (Join-Path $InstallRoot "$ProfileName.watchdog.ps1"),
-        (Join-Path $InstallRoot "$ProfileName.stop.ps1")
-    )) {
-        if (Test-Path $f) { Remove-Item $f -Force; Write-Ok "Видалено: $f" }
-    }
-
-    if ($state) {
-        if ($state.CacheDir -and (Test-Path $state.CacheDir) -and
-            (Read-YesNo "Видалити кеш '$($state.CacheDir)'?" $false)) {
-            Remove-Item $state.CacheDir -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Ok 'Кеш видалено'
-        }
-        if ($state.ConfPath -and (Read-YesNo "Видалити секцію [$ProfileName] з rclone.conf?" $false)) {
-            Remove-RcloneSection -Path $state.ConfPath -Name $ProfileName
-            Write-Ok 'Секцію видалено'
-        }
-        Remove-Item $StateFile -Force -ErrorAction SilentlyContinue
-    }
-
-    Write-Ok 'Готово.'
-    Read-Host "`nEnter для виходу"
-    exit
-}
-
-# ===========================================================================
-# 1. ЗАЛЕЖНОСТІ
-# ===========================================================================
-Write-Step 'Перевірка залежностей'
-
-$winfsp = Get-Service -Name 'WinFsp.Launcher' -ErrorAction SilentlyContinue
-if (-not $winfsp) {
-    Write-Warn2 'WinFsp не знайдено — без нього монтування в літеру диска неможливе.'
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        if (Read-YesNo 'Встановити WinFsp через winget?' $true) {
-            winget install -e --id WinFsp.WinFsp --accept-package-agreements --accept-source-agreements
-            Start-Sleep 3
-            $winfsp = Get-Service -Name 'WinFsp.Launcher' -ErrorAction SilentlyContinue
-        }
-    }
-    if (-not $winfsp) {
-        Write-Err "Встановіть WinFsp вручну: $WinFspUrl , потім перезапустіть скрипт."
-        Read-Host 'Enter для виходу'; exit 1
+    RAIDRIVE = @{
+        'vfs-cache-mode'          = 'writes'
+        'vfs-cache-max-age'       = '1h'
+        'vfs-cache-poll-interval' = '30s'
+        'vfs-read-ahead'          = '0'
+        'vfs-write-back'          = '0s'
+        'dir-cache-time'          = '10s'
+        'attr-timeout'            = '0s'
+        'no-modtime'              = $true
     }
 }
-Write-Ok 'WinFsp присутній'
+$p = $profiles[$Mode]
 
-function Install-RclonePortable {
-    param([string]$Dest)
-    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
-    $zip = Join-Path $env:TEMP 'rclone-dl.zip'
-    $tmp = Join-Path $env:TEMP 'rclone-unzip'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Write-Info 'Завантаження rclone...'
-    Invoke-WebRequest -Uri $RcloneDlUrl -OutFile $zip -UseBasicParsing
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive $zip -DestinationPath $tmp -Force
-    $src = Get-ChildItem $tmp -Recurse -Filter rclone.exe | Select-Object -First 1
-    Copy-Item $src.FullName (Join-Path $Dest 'rclone.exe') -Force
-    Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    return (Join-Path $Dest 'rclone.exe')
+# --- Витягування командного рядка з VBS -------------------------------------
+# Формат рядка: sh.Run "<cmd з подвоєними лапками>", 0, False
+$vbs = Get-Content -LiteralPath $LaunchVbs -Raw -Encoding Default
+if ($vbs -notmatch '(?m)^sh\.Run\s+"(.*)",\s*0,\s*False\s*$') {
+    Write-Err 'Не вдалося розібрати VBS-лаунчер.'
+    Read-Host 'Enter'; exit 1
+}
+$cmd = $Matches[1] -replace '""','"'     # знімаємо подвоєння
+Write-Info 'Поточні прапорці:'
+foreach ($k in @('vfs-cache-mode','attr-timeout','dir-cache-time','vfs-write-back')) {
+    if ($cmd -match "--$k\s+(\S+)") { Write-Info "  --$k $($Matches[1])" }
 }
 
-$rclone = $null
-if (Test-Path "$InstallRoot\rclone.exe") { $rclone = "$InstallRoot\rclone.exe" }
-if (-not $rclone) {
-    $cmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
-    if ($cmd) { $rclone = $cmd.Source }
-}
-
-# Бінарник із стороннього GUI зникне при його оновленні/видаленні,
-# а в завданні Планувальника шлях зашитий абсолютний.
-if ($rclone -and $rclone -match 'com\.rclone\.ui|rcloneview|RcloneBrowser') {
-    Write-Warn2 'Знайдений rclone належить сторонньому GUI:'
-    Write-Info  $rclone
-    Write-Warn2 'При оновленні/видаленні того GUI завдання зламається.'
-    if (Read-YesNo "Поставити незалежний rclone у $InstallRoot ?" $true) {
-        $rclone = Install-RclonePortable -Dest $InstallRoot
-    }
-}
-
-if (-not $rclone) {
-    Write-Warn2 'rclone не знайдено.'
-    if ((Get-Command winget -ErrorAction SilentlyContinue) -and
-        (Read-YesNo 'Встановити rclone через winget?' $true)) {
-        winget install -e --id Rclone.Rclone --accept-package-agreements --accept-source-agreements
-        $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
-                    [Environment]::GetEnvironmentVariable('Path','User')
-        $cmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
-        if ($cmd) { $rclone = $cmd.Source }
-    }
-    if (-not $rclone -and (Read-YesNo "Завантажити портативний rclone у $InstallRoot ?" $true)) {
-        $rclone = Install-RclonePortable -Dest $InstallRoot
-    }
-}
-if (-not $rclone) { Write-Err 'rclone відсутній.'; Read-Host 'Enter'; exit 1 }
-
-Write-Ok (& $rclone version | Select-Object -First 1)
-Write-Info "Шлях: $rclone"
-
-# ===========================================================================
-# 2. ПАРАМЕТРИ ПІДКЛЮЧЕННЯ
-# ===========================================================================
-Write-Step 'Параметри підключення'
-
-$proto = (Read-Default 'Протокол (webdav / sftp)' 'webdav').ToLower()
-if ($proto -notin @('webdav','sftp')) { Write-Err 'Лише webdav або sftp.'; exit 1 }
-
-$srvHost = Read-Default 'Хост (без схеми), напр. fs.example.com' ''
-if (-not $srvHost) { Write-Err 'Хост обовʼязковий.'; exit 1 }
-
-$useTls = $false
-$url    = $null
-$vendor = $null
-if ($proto -eq 'webdav') {
-    $port   = Read-Default 'Порт (Synology WebDAV over HTTPS = 5006, reverse proxy = 443)' '5006'
-    $useTls = Read-YesNo 'HTTPS?' $true
-    if ($useTls) { $scheme = 'https' } else { $scheme = 'http' }
-    if (($useTls -and $port -eq '443') -or ((-not $useTls) -and $port -eq '80')) {
-        $url = "${scheme}://${srvHost}/"
+# --- Патчинг ----------------------------------------------------------------
+foreach ($key in @('vfs-cache-mode','vfs-cache-max-age','vfs-cache-poll-interval',
+                   'vfs-read-ahead','vfs-write-back','dir-cache-time','attr-timeout')) {
+    $val = $p[$key]
+    if ($cmd -match "--$key\s+\S+") {
+        $cmd = $cmd -replace "--$key\s+\S+", "--$key $val"
     } else {
-        $url = "${scheme}://${srvHost}:${port}/"
+        $cmd = $cmd + " --$key $val"     # прапорця не було - дописуємо
     }
-    Write-Info "URL: $url"
-    $vendor = Read-Default 'Vendor (для Synology DSM = other)' 'other'
-} else {
-    $port = Read-Default 'Порт SFTP' '22'
 }
 
-$user = Read-Default 'Логін' $env:USERNAME
+# --no-modtime не має значення, тож додаємо/прибираємо цілком
+$cmd = $cmd -replace '\s--no-modtime\b', ''
+if ($p['no-modtime']) { $cmd = $cmd + ' --no-modtime' }
 
-$sec  = Read-Host 'Пароль' -AsSecureString
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-try     { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+$cmd = ($cmd -replace '\s{2,}', ' ').Trim()
 
-# obscure через stdin: пароль не потрапляє в командний рядок і в історію
-$obscured = ($plain | & $rclone obscure -).Trim()
-$plain = $null
-if (-not $obscured) { Write-Err 'Не вдалося обфускувати пароль.'; exit 1 }
-Write-Ok 'Пароль обфусковано'
-
-$skipCert = $false
-if ($proto -eq 'webdav' -and $useTls) {
-    $skipCert = Read-YesNo 'Сертифікат самопідписаний (вимкнути перевірку TLS)?' $false
-    if ($skipCert) { Write-Warn2 'Перевірку сертифіката вимкнено — канал вразливий до MITM.' }
-}
-
-# ===========================================================================
-# 3. ПАРАМЕТРИ МОНТУВАННЯ
-# ===========================================================================
-Write-Step 'Параметри монтування'
-
-$busy = @()
-$busy += (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue).Name
-$busy += (Get-CimInstance Win32_NetworkConnection -ErrorAction SilentlyContinue |
-          ForEach-Object { $_.LocalName -replace ':','' })
-$busy = $busy | Where-Object { $_ -match '^[A-Za-z]$' } | ForEach-Object { $_.ToUpper() } |
-        Sort-Object -Unique
-
-$free = [char[]](68..90) | Where-Object { $busy -notcontains [string]$_ }   # D..Z
-
-Write-Info "Зайняті: $($busy -join ' ')"
-Write-Info "Вільні:  $($free -join ' ')"
-if (-not $free) { Write-Err 'Немає вільних літер у діапазоні D..Z.'; exit 1 }
-
-# Дефолту навмисно немає: вибір літери має бути свідомим
-$drive = $null
-while (-not $drive) {
-    $in = (Read-Host 'Літера диска (обовʼязково)').Trim().TrimEnd(':').ToUpper()
-    if ([string]::IsNullOrWhiteSpace($in)) { Write-Warn2 'Значення обовʼязкове — дефолту немає.' }
-    elseif ($in -notmatch '^[D-Z]$')       { Write-Warn2 'Одна літера D..Z (A-C зарезервовані).' }
-    elseif ($busy -contains $in)           { Write-Warn2 "Літера ${in}: вже зайнята." }
-    else                                   { $drive = $in }
-}
-Write-Ok "Обрано ${drive}:"
-
-$subPath = Read-Default 'Підтека на сервері (порожньо = корінь)' ''
-if ($subPath) { $remoteSpec = "${ProfileName}:$($subPath.Trim('/'))" }
-else          { $remoteSpec = "${ProfileName}:" }
-
-$volName   = Read-Default 'Мітка тому в Провіднику' $ProfileName
-$cacheDir  = Read-Default 'Тека VFS-кешу (бажано окремий SSD)' 'D:\rclone-cache'
-$cacheMax  = Read-Default 'Ліміт кешу' '20G'
-$cacheAge  = Read-Default 'Час життя кешу' '72h'
-$dirCache  = Read-Default 'TTL кешу директорій (менше = швидше видно чужі зміни)' '20s'
-$readOnly  = Read-YesNo 'Режим "лише читання"?' $false
-$noModTime = Read-YesNo 'Ігнорувати modtime (Synology WebDAV не приймає PROPPATCH)?' ($proto -eq 'webdav')
-# Synology віддає в корені елементи, які rclone бачить як symlink -> ERROR у лозі
-$useLinks  = Read-YesNo 'Обробляти symlink як .rclonelink (прибирає помилку в корені)?' ($proto -eq 'webdav')
-$bwLimit   = Read-Default 'Обмеження швидкості (10M або 10M:5M, порожньо = без ліміту)' ''
-$startDelay   = Read-Default 'Затримка старту після входу, секунд' '15'
-$wantWatchdog = Read-YesNo 'Створити watchdog (перевірка живості кожні 5 хв)?' $true
-
-$logDir  = Join-Path $InstallRoot 'logs'
-$logFile = Join-Path $logDir "$ProfileName.mount.log"
-$wdLog   = Join-Path $logDir "$ProfileName.watchdog.log"
-
-# ===========================================================================
-# 4. ЗАПИС rclone.conf
-# ===========================================================================
-Write-Step 'Запис конфігурації'
-
-$confPath = Get-RcloneConfPath -User $TargetUser
-Write-Info "rclone.conf: $confPath"
-
-if (Test-Path $confPath) {
-    $bak = "$confPath.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
-    Copy-Item $confPath $bak -Force
-    Write-Ok "Резервна копія: $bak"
-}
-
-$section = [ordered]@{}
-if ($proto -eq 'webdav') {
-    $section['type']   = 'webdav'
-    $section['url']    = $url
-    $section['vendor'] = $vendor
-    $section['user']   = $user
-    $section['pass']   = $obscured
-} else {
-    $section['type']            = 'sftp'
-    $section['host']            = $srvHost
-    $section['port']            = $port
-    $section['user']            = $user
-    $section['pass']            = $obscured
-    $section['shell_type']      = 'unix'
-    $section['md5sum_command']  = 'md5sum'
-    $section['sha1sum_command'] = 'sha1sum'
-}
-Set-RcloneSection -Path $confPath -Name $ProfileName -Values $section
-Write-Ok "Секцію [$ProfileName] записано"
-
-# ===========================================================================
-# 5. ПЕРЕВІРКА ЗʼЄДНАННЯ
-# ===========================================================================
-Write-Step 'Перевірка зʼєднання'
-
-$testArgs = @('lsd', $remoteSpec, '--config', $confPath, '--timeout','30s','--contimeout','15s')
-if ($skipCert) { $testArgs += '--no-check-certificate' }
-if ($useLinks) { $testArgs += '--links' }
-
-$test = & $rclone @testArgs 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Ok 'Зʼєднання встановлено. Каталоги верхнього рівня:'
-    $test | Select-Object -First 15 | ForEach-Object { Write-Info $_ }
-} else {
-    Write-Err 'Зʼєднання не вдалося:'
-    $test | ForEach-Object { Write-Info $_ }
-    if (-not (Read-YesNo 'Продовжити попри помилку?' $false)) { Read-Host 'Enter'; exit 1 }
-}
-
-# ===========================================================================
-# 6. ТЕКИ ТА ПРАВА
-# ===========================================================================
-Write-Step 'Створення робочих тек'
-foreach ($d in @($InstallRoot, $logDir, $cacheDir)) {
-    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-    Write-Ok $d
-}
-foreach ($d in @($logDir, $cacheDir)) {
-    try {
-        $acl = Get-Acl $d
-        $ace = New-Object Security.AccessControl.FileSystemAccessRule(
-                 $TargetUser,'Modify','ContainerInherit,ObjectInherit','None','Allow')
-        $acl.AddAccessRule($ace); Set-Acl $d $acl
-    } catch { Write-Warn2 "ACL на $d не змінено: $($_.Exception.Message)" }
-}
-Write-Ok "Права на запис надано: $TargetUser"
-
-# ===========================================================================
-# 7. АРГУМЕНТИ MOUNT
-# ===========================================================================
-$mountArgs = @(
-    'mount', "`"$remoteSpec`"", "${drive}:"
-    '--config',                 "`"$confPath`""
-    '--network-mode'
-    '--volname',                "`"$volName`""
-    '--vfs-cache-mode',         'full'
-    '--cache-dir',              "`"$cacheDir`""
-    '--vfs-cache-max-size',     $cacheMax
-    '--vfs-cache-max-age',      $cacheAge
-    '--vfs-cache-poll-interval','1m'
-    '--vfs-read-ahead',         '128M'
-    '--vfs-write-back',         '5s'
-    '--buffer-size',            '32M'
-    '--dir-cache-time',         $dirCache
-    '--attr-timeout',           '5s'
-    '--transfers',              '8'
-    '--checkers',               '8'
-    '--timeout',                '120s'
-    '--contimeout',             '30s'
-    '--retries',                '5'
-    '--low-level-retries',      '20'
-    '--log-file',               "`"$logFile`""
-    '--log-level',              'INFO'
-)
-if ($noModTime) { $mountArgs += '--no-modtime' }
-if ($readOnly)  { $mountArgs += '--read-only' }
-if ($skipCert)  { $mountArgs += '--no-check-certificate' }
-if ($useLinks)  { $mountArgs += '--links' }
-if ($bwLimit)   { $mountArgs += @('--bwlimit', $bwLimit) }
-
-$argString = $mountArgs -join ' '
-
-# ===========================================================================
-# 8. ПРИХОВАНИЙ ЛАУНЧЕР + СКРИПТ ЗУПИНКИ
-# ---------------------------------------------------------------------------
-# rclone реалізує --no-console через FreeConsole(), тобто відвʼязується вже
-# ПІСЛЯ того, як Windows створила вікно для console-app. Порожнє вікно лишається
-# висіти, а його закриття шле CTRL_CLOSE_EVENT -> том розмонтовується.
-# wscript.exe з intWindowStyle=0 не створює консоль взагалі.
-# ===========================================================================
-Write-Step 'Генерація лаунчера'
-
-$launchVbs = Join-Path $InstallRoot "$ProfileName.launch.vbs"
-$stopPs1   = Join-Path $InstallRoot "$ProfileName.stop.ps1"
-
-# У VBS-літералі кожна лапка подвоюється
-$cmdLine = ('"' + $rclone + '" ' + $argString) -replace '"','""'
-
+# --- Перезапис VBS ----------------------------------------------------------
+$cmdEsc = $cmd -replace '"','""'
 $vbsBody = @"
 ' Hidden launcher for rclone mount. Profile: $ProfileName
-' Generated by Install-RcloneMount.ps1 -- do not edit manually.
+' Patched by Set-RcloneMountMode.ps1 -- mode: $Mode
 ' intWindowStyle = 0     -> no console window
 ' bWaitOnReturn  = False -> wscript exits at once, rclone keeps running detached
 Set sh = CreateObject("WScript.Shell")
-sh.Run "$cmdLine", 0, False
+sh.Run "$cmdEsc", 0, False
 "@
-# wscript читає .vbs як ANSI: UTF-8 з BOM дасть "Invalid character"
-Set-Content -LiteralPath $launchVbs -Value $vbsBody -Encoding Default
-Write-Ok "Лаунчер: $launchVbs"
+# wscript читає .vbs як ANSI
+Set-Content -LiteralPath $LaunchVbs -Value $vbsBody -Encoding Default
+Write-Ok "Лаунчер оновлено: режим $Mode"
 
-$stopBody = @"
-# Розмонтування профілю '$ProfileName'.
-# Stop-ScheduledTask тут не діє: завдання запускає wscript, який одразу
-# завершується, а rclone лишається окремим відвʼязаним процесом.
-`$p = @(Get-Process rclone -ErrorAction SilentlyContinue |
-        Where-Object { `$_.Path -eq '$rclone' })
-if (`$p.Count -gt 0) { `$p | Stop-Process -Force; "Зупинено процесів: `$(`$p.Count)" }
-else { 'Процесів rclone не знайдено.' }
-"@
-[IO.File]::WriteAllText($stopPs1, $stopBody, (New-Object Text.UTF8Encoding($true)))
-Write-Ok "Скрипт зупинки: $stopPs1"
+Write-Info 'Нові прапорці:'
+foreach ($k in @('vfs-cache-mode','attr-timeout','dir-cache-time','vfs-write-back',
+                 'vfs-cache-max-age')) {
+    if ($cmd -match "--$k\s+(\S+)") { Write-Info "  --$k $($Matches[1])" }
+}
+if ($cmd -match '--no-modtime') { Write-Info '  --no-modtime' }
+else { Write-Info '  modtime: увімкнено (виявлення чужих змін)' }
 
-$wdPath = Join-Path $InstallRoot "$ProfileName.watchdog.ps1"
-if ($wantWatchdog) {
-    $wdBody = @"
-# Watchdog для rclone-mount '$ProfileName' (${drive}:)
-# Test-Path на мертвому WinFsp-томі блокується намертво -> ізолюємо в Job.
-`$ErrorActionPreference = 'SilentlyContinue'
-`$log = '$wdLog'
+# --- Оновлення state --------------------------------------------------------
+if (Test-Path $StateFile) {
+    try {
+        $st = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $st | Add-Member -NotePropertyName Mode         -NotePropertyValue $Mode -Force
+        $st | Add-Member -NotePropertyName VfsCacheMode -NotePropertyValue $p['vfs-cache-mode'] -Force
+        $st | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
+    } catch { Write-Warn2 "state.json не оновлено: $($_.Exception.Message)" }
+}
 
-`$alive = `$false
-`$job = Start-Job { Test-Path '${drive}:\' }
-if (Wait-Job `$job -Timeout 15) { `$alive = [bool](Receive-Job `$job) }
-Remove-Job `$job -Force
+# --- Перезапуск монтування --------------------------------------------------
+# Прапорці читаються лише при старті процесу, тож потрібен саме перезапуск.
+$rcloneExe = $null
+if ($cmd -match '^"([^"]+)"') { $rcloneExe = $Matches[1] }
 
-# Процес може жити, але том вже мертвий -> перезапуск у будь-якому разі
-if (-not `$alive) {
-    "`$(Get-Date -f s)  mount dead -> restart" | Add-Content `$log
-    Get-Process rclone | Where-Object { `$_.Path -eq '$rclone' } | Stop-Process -Force
+$killed = @(Get-Process rclone -ErrorAction SilentlyContinue |
+            Where-Object { -not $rcloneExe -or $_.Path -eq $rcloneExe })
+if ($killed.Count -gt 0) {
+    $killed | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep 3
-    Start-ScheduledTask -TaskName 'rclone-$ProfileName-mount'
-}
-"@
-    [IO.File]::WriteAllText($wdPath, $wdBody, (New-Object Text.UTF8Encoding($true)))
-    Write-Ok "Watchdog: $wdPath"
+    Write-Ok "Зупинено процесів: $($killed.Count)"
 }
 
-# ===========================================================================
-# 9. ЗАВДАННЯ ПЛАНУВАЛЬНИКА
-# ---------------------------------------------------------------------------
-# Служба не підходить: WinFsp-монтування зі служби потрапляє в сесію 0
-# і не буде видимим у Провіднику користувача.
-# ===========================================================================
-Write-Step 'Реєстрація завдань Планувальника'
+Start-ScheduledTask -TaskName $TaskMount
+Start-Sleep 2
 
-$taskMount = "rclone-$ProfileName-mount"
-$taskWd    = "rclone-$ProfileName-watchdog"
-
-foreach ($tn in @($taskMount, $taskWd)) {
-    if (Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $tn -Confirm:$false
-    }
-}
-
-$principal = New-ScheduledTaskPrincipal -UserId $TargetUser -LogonType Interactive -RunLevel Limited
-
-# ExecutionTimeLimit=0 не критичний (wscript завершується миттєво),
-# але лишаємо для сумісності з ручним запуском rclone напряму.
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -StartWhenAvailable -MultipleInstances IgnoreNew
-
-$action  = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$launchVbs`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $TargetUser
-
-Register-ScheduledTask -TaskName $taskMount -Action $action -Trigger $trigger `
-    -Settings $settings -Principal $principal -Force | Out-Null
-
-$t = Get-ScheduledTask -TaskName $taskMount
-$t.Triggers[0].Delay = "PT${startDelay}S"        # час на підняття мережі
-Set-ScheduledTask -InputObject $t | Out-Null
-Write-Ok "$taskMount  (при вході, затримка ${startDelay}s)"
-
-if ($wantWatchdog) {
-    $wdAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$wdPath`""
-    $wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5)
-    $wdSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-        -StartWhenAvailable -MultipleInstances IgnoreNew
-
-    Register-ScheduledTask -TaskName $taskWd -Action $wdAction -Trigger $wdTrigger `
-        -Settings $wdSettings -Principal $principal -Force | Out-Null
-    Write-Ok "$taskWd  (кожні 5 хв)"
-}
-
-# ===========================================================================
-# 10. STATE
-# ===========================================================================
-$wdName = $null
-if ($wantWatchdog) { $wdName = $taskWd }
-
-[pscustomobject]@{
-    ProfileName  = $ProfileName
-    Protocol     = $proto
-    Drive        = "${drive}:"
-    RemoteSpec   = $remoteSpec
-    ConfPath     = $confPath
-    CacheDir     = $cacheDir
-    LogFile      = $logFile
-    RclonePath   = $rclone
-    LaunchVbs    = $launchVbs
-    StopScript   = $stopPs1
-    TargetUser   = $TargetUser
-    TaskMount    = $taskMount
-    TaskWatchdog = $wdName
-    Installed    = (Get-Date -Format s)
-} | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
-
-# ===========================================================================
-# 11. ЗАПУСК І ВЕРИФІКАЦІЯ
-# ---------------------------------------------------------------------------
-# Test-Path з ЕЛЕВОВАНОЇ сесії не бачить том, змонтований у --network-mode
-# під звичайним токеном: мережеві підключення привʼязані до logon session,
-# а UAC видає процесу токен з іншим LUID. Тому основний критерій —
-# живий процес rclone + маркер WinFsp у лозі; Test-Path лише додатковий.
-# ===========================================================================
-Write-Step 'Запуск монтування'
-
-Stop-RcloneByPath -ExePath $rclone | Out-Null
-Start-ScheduledTask -TaskName $taskMount
-
-$proc = @()
-for ($i = 1; $i -le 25; $i++) {
-    Start-Sleep 1
-    $proc = @(Get-Process rclone -ErrorAction SilentlyContinue |
-              Where-Object { $_.Path -eq $rclone })
-    if ($proc.Count -gt 0) { break }
-    Write-Host '.' -NoNewline
-}
-Write-Host ''
-
-$svcStarted = $false
-$fatal      = @()
-if (Test-Path $logFile) {
-    Start-Sleep 3                              # дати WinFsp дописати маркер
-    $tail = Get-Content $logFile -Tail 80 -ErrorAction SilentlyContinue
-    $svcStarted = [bool]($tail -match 'service rclone has been started')
-    $fatal = $tail | Where-Object {
-        $_ -match 'Fatal error|mount helper error|cannot mount|failed to mount'
-    }
-}
-$visible = $false
-try { $visible = Test-Path "${drive}:\" } catch { }
-
-if ($fatal) {
-    Write-Err 'Фатальна помилка монтування:'
-    $fatal | ForEach-Object { Write-Info $_ }
-} elseif ($proc.Count -gt 0 -and ($svcStarted -or $visible)) {
-    Write-Ok "rclone працює (PID $($proc[0].Id)), том ${drive}: піднято"
-    if ($visible) {
-        Get-ChildItem "${drive}:\" -ErrorAction SilentlyContinue |
-            Select-Object -First 10 | ForEach-Object { Write-Info $_.Name }
-    } else {
-        Write-Warn2 "З цієї (елевованої) сесії ${drive}: не видно — очікувано для --network-mode."
-        Write-Info  "Перевірте у ЗВИЧАЙНОМУ PowerShell:  Test-Path ${drive}:\"
-        Write-Info  'Щоб елевовані процеси теж бачили том (потребує перезавантаження):'
-        Write-Info  "  New-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'"
-        Write-Info  '    -Name EnableLinkedConnections -PropertyType DWord -Value 1 -Force'
-    }
+$proc = @(Get-Process rclone -ErrorAction SilentlyContinue |
+          Where-Object { -not $rcloneExe -or $_.Path -eq $rcloneExe })
+if ($proc.Count -gt 0) {
+    Write-Ok "rclone перезапущено (PID $($proc[0].Id))"
+    Write-Info 'Перевірте диск у ЗВИЧАЙНОМУ PowerShell, не в цьому елевованому вікні.'
 } else {
-    Write-Err 'Процес rclone не запустився. Останні рядки логу:'
-    if (Test-Path $logFile) { Get-Content $logFile -Tail 25 | ForEach-Object { Write-Info $_ } }
-    Write-Info ''
-    Write-Info 'Інтерактивний дебаг (у звичайному PowerShell):'
-    Write-Info "  & `"$rclone`" $($argString -replace '--log-level INFO','--log-level DEBUG')"
+    Write-Err 'rclone не піднявся. Дивіться лог:'
+    Write-Info "  Get-Content `"$InstallRoot\logs\$ProfileName.mount.log`" -Tail 30"
 }
-
-# ===========================================================================
-# ПІДСУМОК
-# ===========================================================================
-$taskList = $taskMount
-if ($wantWatchdog) { $taskList = "$taskMount, $taskWd" }
-$sep = '-' * 70
-
-Write-Host ''
-Write-Host $sep -ForegroundColor DarkGray
-Write-Host " Профіль:     $ProfileName ($proto)"
-Write-Host " Диск:        ${drive}:  ->  $remoteSpec"
-Write-Host " rclone:      $rclone"
-Write-Host " Конфіг:      $confPath"
-Write-Host " Кеш:         $cacheDir  (max $cacheMax / $cacheAge)"
-Write-Host " Лог:         $logFile"
-Write-Host " Завдання:    $taskList"
-Write-Host $sep -ForegroundColor DarkGray
-Write-Host @"
-
- Керування:
-
-   Start-ScheduledTask $taskMount
-       змонтувати (через прихований VBS-лаунчер, консольного вікна не буде)
-
-   powershell -ExecutionPolicy Bypass -File "$stopPs1"
-       розмонтувати. Stop-ScheduledTask тут НЕ працює: завдання запускає
-       wscript, який завершується одразу, а rclone лишається окремим процесом.
-
-   Get-Content "$logFile" -Tail 50 -Wait
-       живий лог
-
- Видалення:
-   powershell -ExecutionPolicy Bypass -File "$PSCommandPath" -Uninstall -ProfileName $ProfileName
-
-"@ -ForegroundColor Gray
 
 Read-Host 'Enter для виходу'

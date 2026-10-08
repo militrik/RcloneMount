@@ -6,3 +6,5 @@
 *.watchdog.ps1
 logs/
 rclone.conf
+*.tray.vbs
+*.tray.log

@@ -622,6 +622,11 @@ $mountArgs = @(
     '--buffer-size',            '32M'
     '--dir-cache-time',         $dirCache
     '--attr-timeout',           $attrTimeout
+    # Дефолт rclone на Windows - 0666, без біта виконання. WinFsp транслює
+    # його в ACL без FILE_EXECUTE -> запуск .exe з диска дає "Access denied".
+    # Впливає лише на локальне відображення прав, не на права на сервері.
+    '--file-perms',             '0777'
+    '--dir-perms',              '0777'
     '--transfers',              '8'
     '--checkers',               '8'
     '--timeout',                '120s'
